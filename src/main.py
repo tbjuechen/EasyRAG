@@ -25,6 +25,7 @@ async def main(
         save_inter=True,  # 是否保存检索结果等中间结果
         note="best",  # 中间结果保存路径的备注名字
         config_path="configs/easyrag.yaml",  # 配置文件
+    debug_timing=False,  # 是否输出每个item的各环节耗时
 ):
     # 读入配置文件
     config = get_yaml_data(config_path)
@@ -46,7 +47,13 @@ async def main(
     all_nodes = []
     all_contexts = []
     for query in tqdm(queries, total=len(queries)):
-        res = await rag_pipeline.run(query)
+        res = await rag_pipeline.run(query, debug_timing=debug_timing)
+        if debug_timing and 'timings' in res:
+            timing_str = ", ".join(
+                f"{stage}: {duration * 1000:.1f}ms" for stage, duration in res['timings'].items()
+            )
+            query_id = query.get('id', 'N/A')
+            print(f"[Timing][id={query_id}] {timing_str}")
         answers.append(res['answer'])
         all_nodes.append(res['nodes'])
         all_contexts.append(res['contexts'])

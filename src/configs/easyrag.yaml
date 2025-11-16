@@ -30,10 +30,10 @@ r_use_efficient: 0 # 0-->不加速 1-->使用最大值选择方法加速 2-->使
 
 # 生成参数
 llm_keys: [
-  "your-keys",
-  "your-keys",
+  "",
 ]
-llm_name: "glm-4"
+llm_name: "glm-4.5"
+llm_api_base: "https://open.bigmodel.cn/api/paas/v4/"  # 如需自定义第三方 OpenAI 接口可修改此项
 llm_embed_type: 3 # 最终的上下文文档编码参数
 
 # 文本排序编码方式
@@ -53,6 +53,10 @@ qdrant_url: "http://localhost:6333"
 
 # 本地LLM参数
 # local_llm_name: "Qwen/Qwen2-7B-Instruct"
+
+# 本地 Ollama 参数
+use_local_ollama: true  # 设为 true 表示使用本地 Ollama 模型
+ollama_model: "qwen2:7b"  # 对应 `ollama pull` 的模型名称
 
 # 上下文压缩参数
 compress_method: "" # bm25_extract llmlingua longllmlingua

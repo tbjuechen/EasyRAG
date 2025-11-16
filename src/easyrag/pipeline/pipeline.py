@@ -2,6 +2,9 @@ import os
 os.environ['NLTK_DATA'] = './data/nltk_data/'
 import random
 import asyncio
+from collections import OrderedDict
+from time import perf_counter
+from typing import Optional
 import nest_asyncio
 import torch
 from llama_index.core.retrievers import AutoMergingRetriever
@@ -22,6 +25,7 @@ from ..custom.template import QA_TEMPLATE, MERGE_TEMPLATE
 from ..custom.compressors import ContextCompressor
 from .ingestion import get_node_content as _get_node_content
 from ..utils.llm_utils import local_llm_generate as _local_llm_generate
+from ..utils.ollama_utils import ollama_generate
 from .rag import generation as _generation
 
 
@@ -67,15 +71,22 @@ class EasyRAGPipeline:
         self.ans_refine_type = config['ans_refine_type']
         self.hyde = config['hyde']
         self.hyde_merging = config['hyde_merging']
-        # 初始化 LLM
-        llm_key = random.choice(config["llm_keys"])
-        llm_name = config['llm_name']
-        self.llm = OpenAI(
-            api_key=llm_key,
-            model=llm_name,
-            api_base="https://open.bigmodel.cn/api/paas/v4/",
-            is_chat_model=True,
-        )
+        # LLM 相关配置（远程 / 本地 / Ollama）
+        self.use_local_ollama = config.get('use_local_ollama', False)
+        self.ollama_model = config.get('ollama_model', 'qwen2:7b')
+
+        # 初始化远程 LLM（当不使用本地 Ollama 时）
+        self.llm = None
+        if not self.use_local_ollama:
+            llm_key = random.choice(config["llm_keys"])
+            llm_name = config['llm_name']
+            llm_api_base = config.get("llm_api_base", "https://open.bigmodel.cn/api/paas/v4/")
+            self.llm = OpenAI(
+                api_key=llm_key,
+                model=llm_name,
+                api_base=llm_api_base,
+                is_chat_model=True,
+            )
         self.qa_template = self.build_prompt_template(QA_TEMPLATE)
         self.merge_template = self.build_prompt_template(MERGE_TEMPLATE)
 
@@ -312,6 +323,11 @@ class EasyRAGPipeline:
         return filters, filter_dict
 
     async def generation(self, llm, fmt_qa_prompt):
+        # 使用本地 Ollama 时，直接调用本地接口
+        if getattr(self, 'use_local_ollama', False):
+            ret = ollama_generate(self.ollama_model, fmt_qa_prompt)
+            return ret
+        # 否则使用原有的 LLM 调用
         return await _generation(llm, fmt_qa_prompt)
 
     def get_node_content(self, node) -> str:
@@ -320,28 +336,41 @@ class EasyRAGPipeline:
     def local_llm_generate(self, query):
         return _local_llm_generate(query, self.local_llm_model, self.local_llm_tokenizer)
 
-    async def run(self, query: dict) -> dict:
+    async def run(self, query: dict, debug_timing: bool = False) -> dict:
         '''
         "query":"问题" #必填
         "document": "所属路径" #用于过滤文档，可选
         '''
+        timings = OrderedDict() if debug_timing else None
+        total_start = perf_counter() if timings is not None else None
         if self.hyde:
+            hyde_start = perf_counter() if timings is not None else None
             hyde_query = self.hyde_transform(query["query"])
             query["hyde_query"] = hyde_query.custom_embedding_strs[0]
+            if timings is not None:
+                timings["hyde_transform"] = perf_counter() - hyde_start
+        filter_start = perf_counter() if timings is not None else None
         self.filters, self.filter_dict = self.build_filters(query)
+        if timings is not None:
+            timings["build_filters"] = perf_counter() - filter_start
         if self.rerank_fusion_type == 0:
             self.retriever.filters = self.filters
             self.retriever.filter_dict = self.filter_dict
             res = await self.generation_with_knowledge_retrieval(
                 query_str=query["query"],
-                hyde_query=query.get("hyde_query", "")
+                hyde_query=query.get("hyde_query", ""),
+                timings=timings,
             )
         else:
             self.dense_retriever.filters = self.filters
             self.sparse_retriever.filter_dict = self.filter_dict
             res = await self.generation_with_rerank_fusion(
                 query_str=query["query"],
+                timings=timings,
             )
+        if timings is not None:
+            timings["total"] = perf_counter() - total_start
+            res["timings"] = timings
         return res
 
     def sort_by_retrieval(self, nodes):
@@ -351,9 +380,15 @@ class EasyRAGPipeline:
     async def generation_with_knowledge_retrieval(
             self,
             query_str: str,
-            hyde_query: str=""
+            hyde_query: str="",
+            timings: Optional[OrderedDict] = None,
     ):
+        bundle_start = perf_counter() if timings is not None else None
         query_bundle = self.build_query_bundle(query_str+hyde_query)
+        if timings is not None:
+            timings["build_query_bundle"] = perf_counter() - bundle_start
+
+        retrieval_start = perf_counter() if timings is not None else None
         node_with_scores = await self.sparse_retriever.aretrieve(query_bundle)
         if self.path_retriever is not None:
             node_with_scores_path = await self.path_retriever.aretrieve(query_bundle)
@@ -363,7 +398,11 @@ class EasyRAGPipeline:
             node_with_scores,
             node_with_scores_path,
         ])
+        if timings is not None:
+            timings["retrieval"] = perf_counter() - retrieval_start
+
         if self.reranker:
+            rerank_start = perf_counter() if timings is not None else None
             if self.hyde_merging and self.hyde:
                 hyde_query_top1_chunk = f'问题：{query_str},\n 可能有用的提示文档:{hyde_query},\n ' \
                                         f'检索得到的相关上下文：{self.get_node_content(node_with_scores[0])}'
@@ -371,42 +410,76 @@ class EasyRAGPipeline:
                 query_bundle = self.build_query_bundle(query_str + "\n" + hyde_merging_query_bundle.custom_embedding_strs[0])
 
             node_with_scores = self.reranker.postprocess_nodes(node_with_scores, query_bundle)
+            if timings is not None:
+                timings["rerank"] = perf_counter() - rerank_start
+
+        context_start = perf_counter() if timings is not None else None
         contents = [self.get_node_content(node=node) for node in node_with_scores]
         context_str = "\n\n".join(
             [f"### 文档{i}: {content}" for i, content in enumerate(contents)]
         )
+        if timings is not None:
+            timings["context_build"] = perf_counter() - context_start
+
         if self.re_only:
             return {"answer": "", "nodes": node_with_scores, "contexts": contents}
         fmt_qa_prompt = self.qa_template.format(
             context_str=context_str, query_str=query_str
         )
+        gen_start = perf_counter() if timings is not None else None
         ret = await self.generation(self.llm, fmt_qa_prompt)
+        if timings is not None:
+            timings["llm_generation"] = perf_counter() - gen_start
         if self.ans_refine_type == 1:
+            refine_start = perf_counter() if timings is not None else None
             fmt_merge_prompt = self.merge_template.format(
                 context_str=contents[0], query_str=query_str, answer_str=ret.text
             )
             ret = await self.generation(self.llm, fmt_merge_prompt)
+            if timings is not None:
+                timings["answer_refine"] = perf_counter() - refine_start
         elif self.ans_refine_type == 2:
             ret.text = ret.text + "\n\n" + contents[0]
+            if timings is not None:
+                timings["answer_refine"] = timings.get("answer_refine", 0.0)
         return {"answer": ret.text, "nodes": node_with_scores, "contexts": contents}
 
     async def generation_with_rerank_fusion(
             self,
             query_str: str,
+            timings: Optional[OrderedDict] = None,
     ):
         # 暂不维护
+        bundle_start = perf_counter() if timings is not None else None
         query_bundle = self.build_query_bundle(query_str)
+        if timings is not None:
+            timings["build_query_bundle"] = perf_counter() - bundle_start
 
+        dense_start = perf_counter() if timings is not None else None
         node_with_scores_dense = await self.dense_retriever.aretrieve(query_bundle)
+        if timings is not None:
+            timings["dense_retrieval"] = perf_counter() - dense_start
         if self.reranker:
+            rerank_dense_start = perf_counter() if timings is not None else None
             node_with_scores_dense = self.reranker.postprocess_nodes(node_with_scores_dense, query_bundle)
+            if timings is not None:
+                timings["rerank_dense"] = perf_counter() - rerank_dense_start
 
+        sparse_start = perf_counter() if timings is not None else None
         node_with_scores_sparse = await self.sparse_retriever.aretrieve(query_bundle)
+        if timings is not None:
+            timings["sparse_retrieval"] = perf_counter() - sparse_start
         if self.reranker:
+            rerank_sparse_start = perf_counter() if timings is not None else None
             node_with_scores_sparse = self.reranker.postprocess_nodes(node_with_scores_sparse, query_bundle)
+            if timings is not None:
+                timings["rerank_sparse"] = perf_counter() - rerank_sparse_start
 
+        fusion_start = perf_counter() if timings is not None else None
         node_with_scores = HybridRetriever.reciprocal_rank_fusion([node_with_scores_sparse, node_with_scores_dense],
                                                                   topk=self.r_topk_1)
+        if timings is not None:
+            timings["fusion"] = perf_counter() - fusion_start
         # node_with_scores = HybridRetriever.fusion([node_with_scores_sparse, node_with_scores_dense], topk=reranker.top_n)
 
         if self.re_only:
@@ -414,6 +487,7 @@ class EasyRAGPipeline:
             return {"answer": "", "nodes": node_with_scores, "contexts": contents}
 
         if self.rerank_fusion_type == 1:
+            context_start = perf_counter() if timings is not None else None
             contents = [self.get_node_content(node) for node in node_with_scores]
             context_str = "\n\n".join(
                 [f"### 文档{i}: {content}" for i, content in enumerate(contents)]
@@ -421,8 +495,14 @@ class EasyRAGPipeline:
             fmt_qa_prompt = self.qa_template.format(
                 context_str=context_str, query_str=query_str
             )
+            if timings is not None:
+                timings["context_build"] = timings.get("context_build", 0.0) + (perf_counter() - context_start)
+            gen_start = perf_counter() if timings is not None else None
             ret = await self.generation(self.llm, fmt_qa_prompt)
+            if timings is not None:
+                timings["llm_generation"] = timings.get("llm_generation", 0.0) + (perf_counter() - gen_start)
         else:
+            context_start = perf_counter() if timings is not None else None
             contents = [self.get_node_content(node) for node in node_with_scores_sparse]
             context_str = "\n\n".join(
                 [f"### 文档{i}: {content}" for i, content in enumerate(contents)]
@@ -430,8 +510,14 @@ class EasyRAGPipeline:
             fmt_qa_prompt = self.qa_template.format(
                 context_str=context_str, query_str=query_str
             )
+            if timings is not None:
+                timings["context_build"] = timings.get("context_build", 0.0) + (perf_counter() - context_start)
+            gen_start = perf_counter() if timings is not None else None
             ret_sparse = await self.generation(self.llm, fmt_qa_prompt)
+            if timings is not None:
+                timings["llm_generation"] = timings.get("llm_generation", 0.0) + (perf_counter() - gen_start)
 
+            context_start = perf_counter() if timings is not None else None
             contents = [self.get_node_content(node) for node in node_with_scores_dense]
             context_str = "\n\n".join(
                 [f"### 文档{i}: {content}" for i, content in enumerate(contents)]
@@ -439,7 +525,12 @@ class EasyRAGPipeline:
             fmt_qa_prompt = self.qa_template.format(
                 context_str=context_str, query_str=query_str
             )
+            if timings is not None:
+                timings["context_build"] = timings.get("context_build", 0.0) + (perf_counter() - context_start)
+            gen_start = perf_counter() if timings is not None else None
             ret_dense = await self.generation(self.llm, fmt_qa_prompt)
+            if timings is not None:
+                timings["llm_generation"] = timings.get("llm_generation", 0.0) + (perf_counter() - gen_start)
 
             if self.rerank_fusion_type == 2:
                 if len(ret_dense.text) >= len(ret_sparse.text):
